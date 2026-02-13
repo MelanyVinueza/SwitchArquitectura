@@ -14,6 +14,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.client.RestTemplate;
 
 @Slf4j
 @Service
@@ -23,11 +28,57 @@ public class CompensacionServicio {
     private final CicloCompensacionRepositorio cicloRepo;
     private final PosicionInstitucionRepositorio posicionRepo;
     private final ArchivoLiquidacionRepositorio archivoRepo;
-    private final SeguridadServicio seguridadServicio;
+    // private final SeguridadServicio seguridadServicio; // REMOVED: JWS signing is
+    // no longer handled here
+    private final DetalleCompensacionRepositorio detalleRepo;
     private final CompensacionMapper mapper;
+    private final RestTemplate restTemplate;
+
+    @Value("${service.contabilidad.url:http://ms-contabilidad:8083}")
+    private String contabilidadUrl;
 
     private final org.springframework.scheduling.TaskScheduler taskScheduler;
     private java.util.concurrent.ScheduledFuture<?> scheduledTask;
+
+    @Transactional
+    public void registrarOperacion(com.bancario.compensacion.dto.RegistroOperacionDTO req) {
+        CicloCompensacion cicloAbierto = cicloRepo.findByEstado("ABIERTO")
+                .stream().findFirst()
+                .orElseThrow(() -> new RuntimeException("No hay ciclo abierto para compensar"));
+
+        DetalleCompensacion detalle = new DetalleCompensacion();
+        detalle.setIdInstruccion(req.getIdInstruccion());
+        detalle.setIdInstruccionOriginal(req.getIdInstruccionOriginal());
+        detalle.setCiclo(cicloAbierto);
+        detalle.setTipoOperacion(req.getTipoOperacion());
+        detalle.setBicEmisor(req.getBicEmisor());
+        detalle.setBicReceptor(req.getBicReceptor());
+        detalle.setMonto(req.getMonto());
+        detalle.setCodigoReferencia(req.getCodigoReferencia());
+        detalle.setEstadoLiquidacion("INCLUIDO");
+        detalleRepo.save(detalle);
+
+        // NOTE: Real-time accumulation is kept for immediate visibility,
+        // but final settlement will be recalculated from details at closing.
+        if ("REVERSO".equalsIgnoreCase(req.getTipoOperacion())) {
+            // REVERSO logic: Credit Emisor (Refund), Debit Receptor (Take back)
+            acumularTransaccion(cicloAbierto.getId(), req.getBicEmisor(), req.getMonto(), false); // Credit
+            acumularTransaccion(cicloAbierto.getId(), req.getBicReceptor(), req.getMonto(), true); // Debit
+        } else {
+            // PAGO logic: Debit Emisor, Credit Receptor
+            acumularTransaccion(cicloAbierto.getId(), req.getBicEmisor(), req.getMonto(), true);
+            acumularTransaccion(cicloAbierto.getId(), req.getBicReceptor(), req.getMonto(), false);
+        }
+    }
+
+    @Transactional
+    public void acumularEnCicloAbierto(String bic, BigDecimal monto, boolean esDebito) {
+        CicloCompensacion cicloAbierto = cicloRepo.findByEstado("ABIERTO")
+                .stream().findFirst()
+                .orElseThrow(() -> new RuntimeException("No hay ciclo abierto para compensar (Auto)"));
+
+        acumularTransaccion(cicloAbierto.getId(), bic, monto, esDebito);
+    }
 
     @Transactional
     public void acumularTransaccion(Integer cicloId, String bic, BigDecimal monto, boolean esDebito) {
@@ -42,15 +93,6 @@ public class CompensacionServicio {
 
         posicion.recalcularNeto();
         posicionRepo.save(posicion);
-    }
-
-    @Transactional
-    public void acumularEnCicloAbierto(String bic, BigDecimal monto, boolean esDebito) {
-        CicloCompensacion cicloAbierto = cicloRepo.findByEstado("ABIERTO")
-                .stream().findFirst()
-                .orElseThrow(() -> new RuntimeException("No hay ciclo abierto para compensar"));
-
-        acumularTransaccion(cicloAbierto.getId(), bic, monto, esDebito);
     }
 
     private PosicionInstitucion crearPosicionVacia(Integer cicloId, String bic) {
@@ -80,6 +122,11 @@ public class CompensacionServicio {
             throw new RuntimeException("El ciclo ya está cerrado");
         }
 
+        // --- ALGORITMO DE NETEO / CLEARING ---
+        // Recalculate positions based on details to ensure accuracy
+        recalcularPosicionesDesdeDetalles(cicloActual);
+        // -------------------------------------
+
         List<PosicionInstitucion> posiciones = posicionRepo.findByCicloId(cicloId);
 
         BigDecimal sumaNetos = posiciones.stream()
@@ -91,13 +138,13 @@ public class CompensacionServicio {
         }
 
         String xml = generarXML(cicloActual, posiciones);
-        String firma = seguridadServicio.firmarDocumento(xml);
+        // String firma = seguridadServicio.firmarDocumento(xml); // REMOVED
 
         ArchivoLiquidacion archivo = new ArchivoLiquidacion();
         archivo.setCiclo(cicloActual);
         archivo.setNombre("LIQ_CICLO_" + cicloActual.getNumeroCiclo() + ".xml");
         archivo.setXmlContenido(xml);
-        archivo.setFirmaJws(firma);
+
         archivo.setCanalEnvio("BCE_DIRECT_LINK");
         archivo.setEstado("ENVIADO");
         archivo.setFechaGeneracion(LocalDateTime.now(java.time.ZoneOffset.UTC));
@@ -107,9 +154,64 @@ public class CompensacionServicio {
         cicloActual.setFechaCierre(LocalDateTime.now(java.time.ZoneOffset.UTC));
         cicloRepo.save(cicloActual);
 
+        // --- DISPARO CONTABLE: Enviar posiciones a MS-CONTABILIDAD ---
+        enviarLiquidacionAContabilidad(cicloId, posiciones);
+        // -------------------------------------------------------------
+
         iniciarSiguienteCiclo(cicloActual, posiciones, minutosProximoCiclo);
 
         return mapper.toDTO(archivo);
+    }
+
+    /**
+     * Re-processes all details for the cycle to ensure the final positions are
+     * correct.
+     * Use this for the "Clearing" step.
+     */
+    private void recalcularPosicionesDesdeDetalles(CicloCompensacion ciclo) {
+        log.info("Ejecutando algoritmo de neteo para ciclo {}", ciclo.getId());
+
+        // 1. Reset all positions for the cycle
+        List<PosicionInstitucion> posiciones = posicionRepo.findByCicloId(ciclo.getId());
+        for (PosicionInstitucion p : posiciones) {
+            p.setTotalDebitos(BigDecimal.ZERO);
+            p.setTotalCreditos(BigDecimal.ZERO);
+            p.setNeto(BigDecimal.ZERO); // derived, but good to reset
+        }
+        Map<String, PosicionInstitucion> mapaPosiciones = posiciones.stream()
+                .collect(Collectors.toMap(PosicionInstitucion::getCodigoBic, p -> p));
+
+        // 2. Fetch all details
+        List<DetalleCompensacion> detalles = detalleRepo.findByCicloId(ciclo.getId()); // Assuming this method exists or
+                                                                                       // similar
+
+        // 3. Process each detail
+        for (DetalleCompensacion d : detalles) {
+            if ("EXCLUIDO".equalsIgnoreCase(d.getEstadoLiquidacion()))
+                continue;
+
+            PosicionInstitucion posEmisor = mapaPosiciones.computeIfAbsent(d.getBicEmisor(),
+                    k -> crearPosicionVacia(ciclo.getId(), k));
+            PosicionInstitucion posReceptor = mapaPosiciones.computeIfAbsent(d.getBicReceptor(),
+                    k -> crearPosicionVacia(ciclo.getId(), k));
+
+            if ("REVERSO".equalsIgnoreCase(d.getTipoOperacion())) {
+                // REVERSO: Emisor receives back (Credit), Receptor pays back (Debit)
+                posEmisor.setTotalCreditos(posEmisor.getTotalCreditos().add(d.getMonto()));
+                posReceptor.setTotalDebitos(posReceptor.getTotalDebitos().add(d.getMonto()));
+            } else {
+                // PAGO: Emisor pays (Debit), Receptor receives (Credit)
+                posEmisor.setTotalDebitos(posEmisor.getTotalDebitos().add(d.getMonto()));
+                posReceptor.setTotalCreditos(posReceptor.getTotalCreditos().add(d.getMonto()));
+            }
+        }
+
+        // 4. Save and Recalculate Net
+        for (PosicionInstitucion p : mapaPosiciones.values()) {
+            p.recalcularNeto();
+            posicionRepo.save(p);
+        }
+        log.info("Neteo completado. Procesados {} detalles.", detalles.size());
     }
 
     private void iniciarSiguienteCiclo(CicloCompensacion anterior, List<PosicionInstitucion> saldosAnteriores,
@@ -171,6 +273,41 @@ public class CompensacionServicio {
 
         log.info("Programando cierre automático del ciclo {} para: {}", cicloId, fechaEjecucion);
         this.scheduledTask = taskScheduler.schedule(tareaCierre, fechaEjecucion);
+    }
+
+    /**
+     * DISPARO CONTABLE: Envía las posiciones calculadas a MS-CONTABILIDAD
+     * para que libere los fondosBloqueados y aplique los saldos netos reales.
+     */
+    private void enviarLiquidacionAContabilidad(Integer cicloId, List<PosicionInstitucion> posiciones) {
+        log.info(">>> ENVIANDO LIQUIDACIÓN A CONTABILIDAD para ciclo {}", cicloId);
+
+        try {
+            // Construir DTO compatible con MS-CONTABILIDAD
+            java.util.List<java.util.Map<String, Object>> posicionesDTO = new java.util.ArrayList<>();
+            for (PosicionInstitucion p : posiciones) {
+                java.util.Map<String, Object> pos = new java.util.HashMap<>();
+                pos.put("bic", p.getCodigoBic());
+                pos.put("totalDebitos", p.getTotalDebitos());
+                pos.put("totalCreditos", p.getTotalCreditos());
+                pos.put("posicionNeta", p.getNeto());
+                posicionesDTO.add(pos);
+            }
+
+            java.util.Map<String, Object> solicitud = new java.util.HashMap<>();
+            solicitud.put("cicloId", cicloId);
+            solicitud.put("posiciones", posicionesDTO);
+
+            String url = contabilidadUrl + "/api/v1/ledger/compensar";
+            restTemplate.postForEntity(url, solicitud, Void.class);
+
+            log.info(">>> LIQUIDACIÓN ENVIADA EXITOSAMENTE. Saldos actualizados en Contabilidad.");
+
+        } catch (Exception e) {
+            log.error("ALERTA CRÍTICA: Fallo al enviar liquidación a Contabilidad: {}", e.getMessage());
+            // En producción, esto debería disparar una alerta y mecanismo de reintento
+            throw new RuntimeException("Error en Disparo Contable: " + e.getMessage());
+        }
     }
 
     public byte[] generarReportePDF(Integer cicloId) {

@@ -9,5 +9,6 @@ public class SolicitudCreacionDTO {
     private UUID id;
     private UUID idInstruccionOriginal;
     private String codigoMotivo;
+    private String descripcionMotivo;
     private String estado;
 }

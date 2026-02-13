@@ -1,0 +1,9 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] -------------------< com.switchbank:ms-contabilidad >-------------------
+[INFO] Building ms-contabilidad 0.1
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- clean:3.3.2:clean (default-clean) @ ms-contabilidad ---
+^C¨Desea terminar el trabajo por lotes (S/N)? ¨Desea terminar el trabajo por lotes (S/N)? 

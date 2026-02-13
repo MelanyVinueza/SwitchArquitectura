@@ -7,13 +7,14 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Service;
 
 import com.bancario.msdirectorio.dto.InstitucionDTO;
-import com.bancario.msdirectorio.modelo.DatosTecnicos;
 import com.bancario.msdirectorio.modelo.Institucion;
 import com.bancario.msdirectorio.modelo.InterruptorCircuito;
 import com.bancario.msdirectorio.modelo.ReglaEnrutamiento;
@@ -60,7 +61,9 @@ public class DirectorioServicio {
     }
 
     public List<InstitucionDTO> listarTodas() {
-        return mapper.toDTOList(institucionRepositorio.findAll());
+        List<Institucion> all = StreamSupport.stream(institucionRepositorio.findAll().spliterator(), false)
+                .collect(Collectors.toList());
+        return mapper.toDTOList(all);
     }
 
     public Optional<InstitucionDTO> buscarPorBic(String bic) {
@@ -83,28 +86,49 @@ public class DirectorioServicio {
 
         ReglaEnrutamiento nuevaRegla = new ReglaEnrutamiento(nuevaReglaDTO.getPrefijoBin(), nuevaReglaDTO.getAgente());
         inst.getReglasEnrutamiento().add(nuevaRegla);
-        redisTemplate.delete(CACHE_KEY_PREFIX + nuevaRegla.getPrefijoBin());
+        try {
+            redisTemplate.delete(CACHE_KEY_PREFIX + nuevaRegla.getPrefijoBin());
+        } catch (Exception e) {
+            log.warn("Redis no disponible para invalidar cache: {}", e.getMessage());
+        }
 
         return mapper.toDTO(institucionRepositorio.save(inst));
     }
 
+    /**
+     * Busca un banco por BIN (prefijo de cuenta).
+     * DynamoDB no soporta queries sobre nested lists, así que hacemos scan + filtro
+     * en memoria.
+     */
     public Optional<InstitucionDTO> descubrirBancoPorBin(String bin) {
         log.info("Resolviendo BIN: {}", bin);
         if (bin == null)
             return Optional.empty();
         String cacheKey = CACHE_KEY_PREFIX + bin;
 
-        Object cacheData = redisTemplate.opsForValue().get(cacheKey);
-
-        if (cacheData instanceof InstitucionDTO) {
-            return Optional.of((InstitucionDTO) cacheData);
+        try {
+            Object cacheData = redisTemplate.opsForValue().get(cacheKey);
+            if (cacheData instanceof InstitucionDTO) {
+                return Optional.of((InstitucionDTO) cacheData);
+            }
+        } catch (Exception e) {
+            log.warn("Redis no disponible para cache lookup: {}", e.getMessage());
         }
 
-        return institucionRepositorio.findByReglasEnrutamientoPrefijoBin(bin)
+        // Scan all institutions and filter by BIN prefix
+        return StreamSupport.stream(institucionRepositorio.findAll().spliterator(), false)
+                .filter(inst -> inst.getReglasEnrutamiento() != null &&
+                        inst.getReglasEnrutamiento().stream()
+                                .anyMatch(r -> bin.equals(r.getPrefijoBin())))
                 .filter(this::validarDisponibilidad)
+                .findFirst()
                 .map(inst -> {
                     InstitucionDTO dto = mapper.toDTO(inst);
-                    redisTemplate.opsForValue().set(cacheKey, dto, Duration.ofHours(1));
+                    try {
+                        redisTemplate.opsForValue().set(cacheKey, dto, Duration.ofHours(1));
+                    } catch (Exception e) {
+                        log.warn("Redis no disponible para guardar cache: {}", e.getMessage());
+                    }
                     return dto;
                 });
     }
@@ -127,7 +151,6 @@ public class DirectorioServicio {
             if (interruptor.getFallosConsecutivos() >= 5) {
                 interruptor.setEstaAbierto(true);
                 log.error(">>> CIRCUIT BREAKER ACTIVADO para banco: {}", bic);
-
                 invalidarCacheDelBanco(inst);
             }
 
@@ -137,7 +160,13 @@ public class DirectorioServicio {
 
     private void invalidarCacheDelBanco(Institucion inst) {
         if (inst.getReglasEnrutamiento() != null) {
-            inst.getReglasEnrutamiento().forEach(r -> redisTemplate.delete(CACHE_KEY_PREFIX + r.getPrefijoBin()));
+            inst.getReglasEnrutamiento().forEach(r -> {
+                try {
+                    redisTemplate.delete(CACHE_KEY_PREFIX + r.getPrefijoBin());
+                } catch (Exception e) {
+                    log.warn("Redis no disponible para invalidar cache: {}", e.getMessage());
+                }
+            });
         }
     }
 
@@ -171,7 +200,6 @@ public class DirectorioServicio {
 
         if (nuevoEstado != null) {
             try {
-
                 Institucion.Estado estadoEnum = Institucion.Estado.valueOf(nuevoEstado.toUpperCase());
                 inst.setEstadoOperativo(estadoEnum.name());
             } catch (IllegalArgumentException e) {

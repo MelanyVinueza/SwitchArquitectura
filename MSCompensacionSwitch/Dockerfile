@@ -1,13 +1,10 @@
-# Etapa de construcción
-FROM eclipse-temurin:21-jdk-alpine AS build
+FROM maven:3.9.6-eclipse-temurin-21-alpine AS build
 WORKDIR /app
-COPY . .
-RUN chmod +x mvnw
-RUN ./mvnw clean package -DskipTests
+COPY pom.xml .
+COPY src ./src
+RUN mvn clean package -DskipTests
 
-# Etapa de ejecución
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:21-jdk-alpine
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
-EXPOSE 8084
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java","-jar","app.jar"]

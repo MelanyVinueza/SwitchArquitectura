@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.Setter;
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
@@ -23,8 +24,15 @@ public class CuentaTecnica {
     @Column(name = "saldoDisponible", nullable = false, precision = 18, scale = 2)
     private BigDecimal saldoDisponible;
 
+    @Column(name = "fondosBloqueados", nullable = false, precision = 18, scale = 2)
+    private BigDecimal fondosBloqueados = BigDecimal.ZERO;
+
     @Column(name = "firmaIntegridad", nullable = false)
     private String firmaIntegridad;
+
+    // Campo agregado para cumplir con especificación DNS
+    @Column(name = "ultimaConciliacion")
+    private LocalDateTime ultimaConciliacion;
 
     public CuentaTecnica() {
     }
@@ -33,6 +41,7 @@ public class CuentaTecnica {
         this.codigoBic = codigoBic;
 
         this.saldoDisponible = BigDecimal.ZERO.setScale(2, java.math.RoundingMode.HALF_UP);
+        this.fondosBloqueados = BigDecimal.ZERO.setScale(2, java.math.RoundingMode.HALF_UP);
         this.firmaIntegridad = "INITIAL_HASH";
     }
 }

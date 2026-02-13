@@ -1,0 +1,225 @@
+# ✅ URL REAL DEL APIM (Proporcionada por DevOps - 10/Feb/2026)
+@baseUrl = https://gf0js7uezg.execute-api.us-east-2.amazonaws.com/dev
+
+# Para pruebas internas (port-forward): kubectl port-forward svc/switch-ms-nucleo 8082:80 -n switch
+# @baseUrl = http://localhost:8082
+
+# Para pruebas directas al directorio: kubectl port-forward svc/switch-ms-directorio 8081:80 -n switch
+@directorioUrl = http://localhost:8081
+
+
+# ============================================================================
+# FASE 0: REGISTRAR BANCOS EN EL DIRECTORIO (IMPORTANTE - HACER PRIMERO)
+# ============================================================================
+# Antes de hacer transferencias, el Switch necesita saber DONDE están los bancos.
+# Ejecuta: kubectl port-forward svc/switch-ms-directorio 8081:80 -n switch
+
+### 0.1 Registrar BANTEC en el Directorio
+POST {{directorioUrl}}/api/v1/instituciones
+Content-Type: application/json
+
+{
+  "codigoBic": "BANTEC",
+  "nombre": "Banco Bantec",
+  "urlDestino": "http://service-transacciones.bantec.svc.cluster.local:8080/api/v2/switch/transfers",
+  "estadoOperativo": "ONLINE",
+  "reglasEnrutamiento": [
+    { "prefijoBin": "700", "agente": "BANTEC" }
+  ],
+  "interruptorCircuito": {
+    "estaAbierto": false,
+    "fallosConsecutivos": 0
+  }
+}
+
+### 0.2 Registrar ARCBANK en el Directorio
+POST {{directorioUrl}}/api/v1/instituciones
+Content-Type: application/json
+
+{
+  "codigoBic": "ARCBANK",
+  "nombre": "Banco ArcBank",
+  "urlDestino": "http://service-transacciones.arcbank.svc.cluster.local:8080/api/v2/switch/transfers",
+  "estadoOperativo": "ONLINE",
+  "reglasEnrutamiento": [
+    { "prefijoBin": "800", "agente": "ARCBANK" }
+  ],
+  "interruptorCircuito": {
+    "estaAbierto": false,
+    "fallosConsecutivos": 0
+  }
+}
+
+### 0.3 Verificar que los bancos están registrados
+GET {{directorioUrl}}/api/v1/instituciones
+
+### 0.4 Verificar BANTEC
+GET {{directorioUrl}}/api/v1/instituciones/BANTEC
+
+### 0.5 Verificar ARCBANK
+GET {{directorioUrl}}/api/v1/instituciones/ARCBANK
+
+
+# ============================================================================
+# FASE 1: HEALTH CHECKS (Verificar estado de los servicios)
+# ============================================================================
+# Usar port-forward al nucleo: kubectl port-forward svc/switch-ms-nucleo 8082:80 -n switch
+@nucleoUrl = http://localhost:8082
+
+### 1.1 Health Check del Nucleo
+GET {{nucleoUrl}}/actuator/health
+
+### 1.2 Health Check APIM (via Gateway externo)
+GET {{baseUrl}}/api/v2/switch/health
+
+
+# ============================================================================
+# FASE 2: TRANSACCION (BANTEC -> ARCBANK)
+# ============================================================================
+
+### 2.1 Transferencia BANTEC -> ARCBANK (via port-forward directo al Nucleo)
+POST {{nucleoUrl}}/api/v2/switch/transfers
+Content-Type: application/json
+
+{
+  "header": {
+    "messageId": "MSG-TEST-001",
+    "creationDateTime": "2026-02-10T22:00:00Z",
+    "originatingBankId": "BANTEC"
+  },
+  "body": {
+    "instructionId": "550e8400-e29b-41d4-a716-446655440001",
+    "endToEndId": "E2E-TEST-001",
+    "amount": {
+      "currency": "USD",
+      "value": 150.00
+    },
+    "debtor": {
+      "name": "Cliente Bantec",
+      "account": "1234567890",
+      "bankId": "BANTEC"
+    },
+    "creditor": {
+      "name": "Cliente ArcBank",
+      "account": "0987654321",
+      "bankId": "ARCBANK"
+    },
+    "remittanceInformation": "Prueba transferencia Switch EKS"
+  }
+}
+
+### 2.2 Transferencia ARCBANK -> BANTEC (via port-forward directo al Nucleo)
+POST {{nucleoUrl}}/api/v2/switch/transfers
+Content-Type: application/json
+
+{
+  "header": {
+    "messageId": "MSG-TEST-002",
+    "creationDateTime": "2026-02-10T22:05:00Z",
+    "originatingBankId": "ARCBANK"
+  },
+  "body": {
+    "instructionId": "550e8400-e29b-41d4-a716-446655440002",
+    "endToEndId": "E2E-TEST-002",
+    "amount": {
+      "currency": "USD",
+      "value": 250.00
+    },
+    "debtor": {
+      "name": "Cliente ArcBank",
+      "account": "0987654321",
+      "bankId": "ARCBANK"
+    },
+    "creditor": {
+      "name": "Cliente Bantec",
+      "account": "1234567890",
+      "bankId": "BANTEC"
+    },
+    "remittanceInformation": "Prueba transferencia inversa"
+  }
+}
+
+
+# ============================================================================
+# FASE 3: CONSULTA DE ESTADO
+# ============================================================================
+
+### 3.1 Consultar estado de la primera transferencia
+GET {{nucleoUrl}}/api/v2/switch/transfers/550e8400-e29b-41d4-a716-446655440001
+
+### 3.2 Consultar estado de la segunda transferencia
+GET {{nucleoUrl}}/api/v2/switch/transfers/550e8400-e29b-41d4-a716-446655440002
+
+### 3.3 Listar últimas transacciones (Dashboard)
+GET {{nucleoUrl}}/api/v1/transacciones
+
+
+# ============================================================================
+# FASE 4: DEVOLUCION (Reverso ISO 20022 pacs.004)
+# ============================================================================
+
+### 4.1 Devolución de la primera transacción
+POST {{nucleoUrl}}/api/v2/switch/returns
+Content-Type: application/json
+
+{
+  "header": {
+    "messageId": "RET-TEST-001",
+    "originatingBankId": "BANTEC"
+  },
+  "body": {
+    "returnInstructionId": "RET-550e8400-001",
+    "originalInstructionId": "550e8400-e29b-41d4-a716-446655440001",
+    "returnReason": "DUPL",
+    "returnAmount": {
+      "currency": "USD",
+      "value": 150.00
+    }
+  }
+}
+
+
+# ============================================================================
+# FASE 5: COMPENSACION
+# ============================================================================
+# Port-forward a compensacion: kubectl port-forward svc/switch-ms-compensacion 8084:80 -n switch
+@compensacionUrl = http://localhost:8084
+
+### 5.1 Listar Ciclos
+GET {{compensacionUrl}}/api/v1/compensacion/ciclos
+
+### 5.2 Ver posiciones del ciclo abierto (Reemplazar ID)
+GET {{compensacionUrl}}/api/v1/compensacion/ciclos/1/posiciones
+
+### 5.3 Ejecutar Cierre Diario
+POST {{compensacionUrl}}/api/v1/compensacion/ciclos/1/cierre?proximoCicloEnMinutos=60
+
+
+# ============================================================================
+# FASE 6: CONTABILIDAD (Verificar saldos)
+# ============================================================================
+# Port-forward a contabilidad: kubectl port-forward svc/switch-ms-contabilidad 8080:80 -n switch
+@contabilidadUrl = http://localhost:8080
+
+### 6.1 Fondeo inicial BANTEC ($5M)
+POST {{contabilidadUrl}}/api/v1/funding/recharge
+Content-Type: application/json
+
+{
+  "codigoBic": "BANTEC",
+  "monto": 5000000.00,
+  "idInstruccion": "FONDEO-BANTEC-001"
+}
+
+### 6.2 Fondeo inicial ARCBANK ($5M)
+POST {{contabilidadUrl}}/api/v1/funding/recharge
+Content-Type: application/json
+
+{
+  "codigoBic": "ARCBANK",
+  "monto": 5000000.00,
+  "idInstruccion": "FONDEO-ARCBANK-001"
+}
+
+### 6.3 Ver movimientos contables
+GET {{contabilidadUrl}}/api/v1/ledger/range?start=2024-01-01T00:00:00&end=2030-12-31T23:59:59

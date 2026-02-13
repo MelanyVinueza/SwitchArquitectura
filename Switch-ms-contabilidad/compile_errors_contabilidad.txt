@@ -1,0 +1,23 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] -------------------< com.switchbank:ms-contabilidad >-------------------
+[INFO] Building ms-contabilidad 0.1
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- clean:3.3.2:clean (default-clean) @ ms-contabilidad ---
+[INFO] Deleting D:\universidad\Semestres\8vo semestre\arquitectura\Switch-V3\SwitchCambios\Switch-ms-contabilidad\target
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ ms-contabilidad ---
+[INFO] Copying 1 resource from src\main\resources to target\classes
+[INFO] Copying 0 resource from src\main\resources to target\classes
+[INFO] 
+[INFO] --- compiler:3.11.0:compile (default-compile) @ ms-contabilidad ---
+[INFO] Changes detected - recompiling the module! :source
+[INFO] Compiling 23 source files with javac [debug release 21] to target\classes
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  6.152 s
+[INFO] Finished at: 2026-02-08T10:39:19-05:00
+[INFO] ------------------------------------------------------------------------

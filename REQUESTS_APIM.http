@@ -1,0 +1,113 @@
+# ✅ URL REAL DEL APIM (Proporcionada por DevOps - 10/Feb/2026)
+@apimUrl = https://gf0js7uezg.execute-api.us-east-2.amazonaws.com/dev
+
+@cognitoAuthUrl = https://auth-banca-digiconecu-dev-lhd4go.auth.us-east-2.amazoncognito.com/oauth2/token
+
+# Credenciales REALES (Nivel: ALTO - No compartir)
+# BANTEC
+@bantecClientId = 7oj12jtu8d3keilv1e1gjkc8e4
+@bantecClientSecret = 16o9bdppi2qku69vuk7qdcim4fqrkmkggder3iq47p9cs29tqqoq
+
+# ARKBANK
+@arkbankClientId = 3jprfuk1phejsm0sjr8p50n91e
+@arkbankClientSecret = 1sbg167h178p9cgfradk51c2qla1u4d5en3tnmljc91kc9rbn9nr
+
+@scope = https://switch-api.com/transfers.write
+
+### 1. PRUEBA DE AUTENTICACION (Obtener Token BANTEC)
+# Si esto responde 200 OK con un token, la seguridad funciona.
+# @name login
+POST {{cognitoAuthUrl}}
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic N29qMTJqdHU4ZDNrZWlsdjFlMWdqa2M4ZTQ6MTZvOWJkcHBpMnFrdTY5dnVrN3FkY2ltNGZxcmtta2dnZGVyM2lxNDdwOWNzMjl0cXFvcQ==
+
+grant_type=client_credentials
+&scope={{scope}}
+
+# Nota: El header Authorization es Base64(ById:Secret) de BANTEC.
+# Calculado previamente para facilitar la prueba.
+
+
+### Variable para guardar el token automáticamente
+@authToken = {{login.response.body.access_token}}
+
+
+### 2. TRANSFERENCIA INTERBANCARIA (A través de APIM)
+# Usa el token obtenido arriba
+POST {{apimUrl}}/api/v2/switch/transfers
+Authorization: Bearer {{authToken}}
+Content-Type: application/json
+X-Trace-ID: {{$guid}}
+
+{
+  "header": {
+    "messageId": "MSG-APIM-{{$guid}}",
+    "creationDateTime": "2026-02-10T15:30:00Z",
+    "originatingBankId": "ARCBANK"
+  },
+  "body": {
+    "instructionId": "INSTR-APIM-{{$guid}}",
+    "endToEndId": "E2E-APIM-{{$guid}}",
+    "amount": {
+      "currency": "USD",
+      "value": 500.00
+    },
+    "debtor": {
+      "name": "Cliente Origen APIM",
+      "account": "100200300",
+      "bankId": "ARCBANK"
+    },
+    "creditor": {
+      "name": "Cliente Destino APIM",
+      "account": "900800700",
+      "bankId": "BANTEC"
+    },
+    "remittanceInformation": "Prueba via APIM Gateway"
+  }
+}
+
+
+### 3. CONSULTA DE ESTADO (Traceability)
+GET {{apimUrl}}/api/v2/switch/transfers/INSTR-APIM-{{$guid}}
+Authorization: Bearer {{authToken}}
+
+
+### 4. VALIDACIÓN DE CUENTA (Account Lookup)
+POST {{apimUrl}}/api/v2/switch/account-lookup
+Authorization: Bearer {{authToken}}
+Content-Type: application/json
+
+{
+  "header": {
+    "messageId": "LKP-{{$guid}}",
+    "originatingBankId": "ARCBANK"
+  },
+  "body": {
+    "requestId": "REQ-{{$guid}}",
+    "targetBankId": "BANTEC",
+    "targetAccountNumber": "900800700"
+  }
+}
+
+
+### 5. DEVOLUCIÓN / REVERSO (pacs.004)
+# Reemplazar 'original-instruction-id' con uno real
+POST {{apimUrl}}/api/v2/switch/returns
+Authorization: Bearer {{authToken}}
+Content-Type: application/json
+
+{
+  "header": {
+    "messageId": "RET-APIM-{{$guid}}",
+    "originatingBankId": "ARCBANK"
+  },
+  "body": {
+    "returnInstructionId": "RET-{{$guid}}",
+    "originalInstructionId": "INSTR-APIM-XYZ123",
+    "returnReason": "DUPL",
+    "returnAmount": {
+      "currency": "USD",
+      "value": 500.00
+    }
+  }
+}

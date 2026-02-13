@@ -1,0 +1,82 @@
+name: "Deploy Frontend to S3"
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-2
+  
+  # ⚠️ CAMBIAR ESTE VALOR SEGÚN TU FRONTEND ⚠️
+  # Ver tabla de valores en GUIA_DESARROLLADORES.md
+  S3_BUCKET: banca-ecosistema-switch-admin-panel-512be32e   # Tu bucket S3
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Build de producción
+        run: npm run build
+        env:
+          # Variables de entorno para el build (opcional)
+          VITE_API_URL: ${{ vars.API_URL }}
+          REACT_APP_API_URL: ${{ vars.API_URL }}
+      
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy a S3
+        run: |
+          # Detectar carpeta de build (React, Vite, Angular)
+          if [ -d "dist" ]; then
+            BUILD_DIR="dist"
+          elif [ -d "build" ]; then
+            BUILD_DIR="build"
+          elif [ -d "out" ]; then
+            BUILD_DIR="out"
+          else
+            echo "❌ No se encontró carpeta de build (dist/, build/, out/)"
+            exit 1
+          fi
+          
+          echo "📦 Desplegando desde $BUILD_DIR a s3://${{ env.S3_BUCKET }}"
+          
+          # Sincronizar archivos a S3
+          aws s3 sync $BUILD_DIR s3://${{ env.S3_BUCKET }} \
+            --delete \
+            --cache-control "max-age=31536000" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # index.html y manifests sin caché (para actualizaciones inmediatas)
+          aws s3 cp $BUILD_DIR/index.html s3://${{ env.S3_BUCKET }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Copiar archivos JSON si existen
+          if ls $BUILD_DIR/*.json 1> /dev/null 2>&1; then
+            aws s3 cp $BUILD_DIR/ s3://${{ env.S3_BUCKET }}/ \
+              --recursive \
+              --exclude "*" \
+              --include "*.json" \
+              --cache-control "no-cache"
+          fi
+      
+      - name: Resumen del despliegue
+        run: |
+          echo "✅ Frontend desplegado exitosamente"
+          echo "🌐 URL: http://${{ env.S3_BUCKET }}.s3-website.${{ env.AWS_REGION }}.amazonaws.com"

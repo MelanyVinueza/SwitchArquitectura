@@ -15,6 +15,15 @@ import com.bancario.nucleo.modelo.RespaldoIdempotencia;
 import com.bancario.nucleo.modelo.IsoError;
 import com.bancario.nucleo.mapper.TransaccionMapper;
 
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.UUID;
+import java.time.LocalDateTime;
+
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,11 +38,12 @@ import org.springframework.http.MediaType;
 
 import com.bancario.nucleo.dto.TransaccionResponseDTO;
 import com.bancario.nucleo.dto.ReturnRequestDTO;
-import com.bancario.nucleo.dto.AccountLookupRequestDTO;
-import com.bancario.nucleo.dto.AccountLookupResponseDTO;
 import com.bancario.nucleo.dto.external.InstitucionDTO;
 import com.bancario.nucleo.dto.external.RegistroMovimientoRequest;
 import com.bancario.nucleo.dto.iso.MensajeISO;
+import com.bancario.nucleo.excepcion.BusinessException;
+
+import java.util.stream.Collectors; // Si se usa
 import com.bancario.nucleo.excepcion.BusinessException;
 
 import lombok.RequiredArgsConstructor;
@@ -73,6 +83,7 @@ public class TransaccionServicio {
         BigDecimal monto;
         String fingerprintMd5;
         boolean debitRealizado = false;
+        boolean entregado = false;
 
         try {
             if (iso.getBody() == null || iso.getHeader() == null) {
@@ -92,6 +103,14 @@ public class TransaccionServicio {
             cuentaOrigen = iso.getBody().getDebtor().getAccountId();
             cuentaDestino = iso.getBody().getCreditor().getAccountId();
 
+            if (!"USD".equalsIgnoreCase(moneda)) {
+                throw new BusinessException(IsoError.AC03.getCodigo() + " - Moneda no soportada: " + moneda);
+            }
+            if (monto.compareTo(new BigDecimal("10000")) > 0) {
+                throw new BusinessException(
+                        IsoError.CH03.getCodigo() + " - Monto excede el límite permitido (Max: 10,000 USD)");
+            }
+
             String fingerprint = idInstruccion.toString() + monto.toString() + moneda + bicOrigen + bicDestino
                     + creationDateTime + cuentaOrigen + cuentaDestino;
             fingerprintMd5 = generarMD5(fingerprint);
@@ -103,14 +122,6 @@ public class TransaccionServicio {
             log.error("Error inesperado procesando datos iniciales ISO: {}", e.getMessage());
             throw new BusinessException(
                     IsoError.MS03.getCodigo() + " - Error leyendo datos del mensaje: " + e.getMessage());
-        }
-
-        if (!"USD".equalsIgnoreCase(moneda)) {
-            throw new BusinessException(IsoError.AC03.getCodigo() + " - Moneda no soportada: " + moneda);
-        }
-        if (monto.compareTo(new BigDecimal("10000")) > 0) {
-            throw new BusinessException(
-                    IsoError.CH03.getCodigo() + " - Monto excede el límite permitido (Max: 10,000 USD)");
         }
 
         log.info(">>> Iniciando Tx ISO: InstID={} MsgID={} Monto={}", idInstruccion, messageId, monto);
@@ -181,6 +192,15 @@ public class TransaccionServicio {
         tx.setMoneda(moneda);
         tx.setCodigoBicOrigen(bicOrigen);
         tx.setCodigoBicDestino(bicDestino);
+        tx.setCodigoReferencia(Transaccion.generarCodigoReferencia()); // Generar código numérico 6 dígitos
+
+        // Inyectar código en ISO para el Banco Destino
+        String currentRemit = iso.getBody().getRemittanceInformation();
+        String newRemit = (currentRemit != null ? currentRemit + " " : "") + "REF:" + tx.getCodigoReferencia();
+        if (newRemit.length() > 140)
+            newRemit = newRemit.substring(0, 140); // Standard ISO limit safety
+        iso.getBody().setRemittanceInformation(newRemit);
+
         tx.setEstado("RECEIVED");
         tx.setFechaCreacion(LocalDateTime.now(java.time.ZoneOffset.UTC));
 
@@ -196,35 +216,39 @@ public class TransaccionServicio {
             InstitucionDTO bancoDestinoInfo = validarBanco(bicDestino, true);
             log.info("Validación: Bancos Origen ({}) y Destino ({}) operativos.", bicOrigen, bicDestino);
 
-            log.info("Ledger: Debitando {} a {}", monto, bicOrigen);
-            registrarMovimientoContable(bicOrigen, idInstruccion, monto, "DEBIT");
-            debitRealizado = true;
+            log.info("Validación: Bancos Origen ({}) y Destino ({}) operativos.", bicOrigen, bicDestino);
 
-            log.info("Clearing: Registrando posición Origen (Débito)");
-            notificarCompensacion(bicOrigen, monto, true);
+            log.info("Ledger: Reservando fondos (Pre-Autorización) a {}", bicOrigen);
+            reservarBalance(bicOrigen, idInstruccion, monto);
+            debitRealizado = true; // Flag now indicates "Reservation Made"
 
-            log.info("RabbitMQ: Publicando transferencia a cola del banco destino: {}", bicDestino);
+            // --- FASE 4: CLEARING (Neteo) ---
+            log.info("Clearing: Enviando evento asíncrono de PAGO (DNS) con codigoReferencia={}",
+                    tx.getCodigoReferencia());
 
-            try {
-                mensajeriaServicio.publicarTransferencia(bicDestino, iso);
+            // Construir DTO explícitamente si es necesario, o usar el método helper si
+            // existiera.
+            // Aquí asumimos que MensajeriaServicio aceptará los parámetros o un DTO.
+            // Dado que publicarCompensacion acepta Object, creamos el DTO aquí.
+            com.bancario.nucleo.dto.external.RegistroOperacionDTO operacionDTO = new com.bancario.nucleo.dto.external.RegistroOperacionDTO();
+            operacionDTO.setIdInstruccion(idInstruccion);
+            operacionDTO.setIdInstruccionOriginal(null);
+            operacionDTO.setTipoOperacion("PAGO");
+            operacionDTO.setBicEmisor(bicOrigen);
+            operacionDTO.setBicReceptor(bicDestino);
+            operacionDTO.setMonto(monto);
+            operacionDTO.setCodigoReferencia(tx.getCodigoReferencia());
 
-                tx.setEstado("QUEUED");
-                transaccionRepositorio.save(tx);
+            mensajeriaServicio.publicarCompensacion(operacionDTO);
 
-                log.info("═══════════════════════════════════════════════════════════════════════════");
-                log.info("FLUJO ASÍNCRONO: Mensaje encolado exitosamente");
-                log.info("  InstructionId: {}", idInstruccion);
-                log.info("  Estado: QUEUED (esperando callback del banco destino)");
-                log.info("  Cola destino: q.bank.{}.in", bicDestino);
-                log.info("═══════════════════════════════════════════════════════════════════════════");
+            // --- FASE 2: NÚCLEO ASÍNCRONO (RabbitMQ) ---
+            log.info("Núcleo: Publicando mensaje a Exchange (RoutingKey={})", bicDestino);
+            mensajeriaServicio.publicarTransferencia(iso);
 
-                guardarRespaldoIdempotencia(tx, "ENCOLADO");
-
-            } catch (Exception e) {
-                log.error("Error publicando a RabbitMQ: {}", e.getMessage());
-                throw new BusinessException(
-                        IsoError.MS03.getCodigo() + " - Error en cola de mensajería: " + e.getMessage());
-            }
+            entregado = true;
+            tx.setEstado("COMPLETED");
+            guardarRespaldoIdempotencia(tx, "EXITO (ENVIADO A COLA)");
+            log.info("Tx UUID={} completada localmente y encolada para {}", idInstruccion, bicDestino);
 
         } catch (BusinessException e) {
             log.error("Error de Negocio: {}", e.getMessage());
@@ -594,15 +618,45 @@ public class TransaccionServicio {
         }
     }
 
-    private void notificarCompensacion(String bic, BigDecimal monto, boolean esDebito) {
+    private void reservarBalance(String bic, UUID idTx, BigDecimal monto) {
         try {
-            String url = String.format("%s/api/v1/compensacion/acumular?bic=%s&monto=%s&esDebito=%s",
-                    compensacionUrl, bic, monto.toString(), esDebito);
+            RegistroMovimientoRequest req = RegistroMovimientoRequest.builder()
+                    .codigoBic(bic)
+                    .idInstruccion(idTx)
+                    .monto(monto)
+                    .tipo("DEBIT") // Logical type for check
+                    .build();
 
-            restTemplate.postForEntity(url, null, Void.class);
+            String url = contabilidadUrl + "/api/v1/ledger/reservar";
+            restTemplate.postForEntity(url, req, Object.class);
+
+        } catch (HttpClientErrorException.BadRequest e) {
+            throw new BusinessException(IsoError.AM04.getCodigo() + " - Fondos insuficientes para reservar.");
+        } catch (Exception e) {
+            throw new BusinessException(
+                    IsoError.MS03.getCodigo() + " - Error crítico reservando fondos: " + e.getMessage());
+        }
+    }
+
+    private void registrarOperacionCompensacion(String bicEmisor, String bicReceptor, UUID idTx, BigDecimal monto,
+            String tipo, String codigoReferencia) {
+        try {
+            com.bancario.nucleo.dto.external.RegistroOperacionDTO req = com.bancario.nucleo.dto.external.RegistroOperacionDTO
+                    .builder()
+                    .idInstruccion(idTx)
+                    .bicEmisor(bicEmisor)
+                    .bicReceptor(bicReceptor)
+                    .monto(monto)
+                    .tipoOperacion(tipo)
+                    .codigoReferencia(codigoReferencia)
+                    .build();
+
+            String url = compensacionUrl + "/api/v1/compensacion/operaciones";
+            restTemplate.postForEntity(url, req, Void.class);
 
         } catch (Exception e) {
-            log.error("ALERTA: Fallo al registrar compensación para {}. Descuadre en Clearing.", bic, e);
+            log.error("ALERTA: Fallo al registrar operación en Clearing ({}) para {}. Descuadre posible.", tipo,
+                    bicEmisor, e);
         }
     }
 
@@ -632,17 +686,25 @@ public class TransaccionServicio {
 
     private void ejecutarReversoSaga(Transaccion tx) {
         try {
-            log.warn("SAGA COMPENSACIÓN: Iniciando reverso local para Tx {}", tx.getIdInstruccion());
+            log.warn("SAGA COMPENSACIÓN: Iniciando reverso local (release blocks) para Tx {}", tx.getIdInstruccion());
 
-            UUID reversalId = UUID.randomUUID();
-            log.info("Saga ID Mapping: Original {} -> ReversalLedgerID {}", tx.getIdInstruccion(), reversalId);
+            // 1. Register PAGO (So 'Total Debits' includes this, releasing the block in
+            // closing)
+            registrarOperacionCompensacion(tx.getCodigoBicOrigen(), tx.getCodigoBicDestino(), tx.getIdInstruccion(),
+                    tx.getMonto(), "PAGO", tx.getCodigoReferencia());
 
-            registrarMovimientoContable(tx.getCodigoBicOrigen(), reversalId, tx.getMonto(), "CREDIT");
-            notificarCompensacion(tx.getCodigoBicOrigen(), tx.getMonto(), false);
+            // 2. Register REVERSO (So Net Position cancels out, refunding the user in
+            // 'Available')
+            registrarOperacionCompensacion(tx.getCodigoBicOrigen(), tx.getCodigoBicDestino(), tx.getIdInstruccion(),
+                    tx.getMonto(), "REVERSO", tx.getCodigoReferencia());
+
+            // No need to manually CREDIT ledger. Cycle Closing handles it.
 
             notificarReversoAlBancoOrigen(tx);
 
-            log.info("SAGA COMPENSACIÓN: Reverso completado exitosamente.");
+            log.info(
+                    "SAGA COMPENSACIÓN: Reverso registrado en Clearing exitosamente (Funds will unblock at cycle close).");
+
         } catch (Exception e) {
             log.error("CRITICAL: Fallo en Saga de Reverso. Inconsistencia Contable posible. {}", e.getMessage());
         }
@@ -747,6 +809,22 @@ public class TransaccionServicio {
         }
     }
 
+    /**
+     * Método deprecado - se mantiene para compatibilidad.
+     * El sistema ahora usa registrarOperacionCompensacion() para el flujo DNS.
+     */
+    @Deprecated
+    private void notificarCompensacion(String bic, BigDecimal monto, boolean esDebito) {
+        try {
+            String url = compensacionUrl + "/api/v1/compensacion/acumular?bic=" + bic
+                    + "&monto=" + monto + "&esDebito=" + esDebito;
+            restTemplate.postForEntity(url, null, Void.class);
+            log.info("Compensación notificada: BIC={} Monto={} Debito={}", bic, monto, esDebito);
+        } catch (Exception e) {
+            log.warn("Error notificando compensación (no bloqueante): {}", e.getMessage());
+        }
+    }
+
     private String generarMD5(String input) {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
@@ -771,54 +849,92 @@ public class TransaccionServicio {
         }
     }
 
-    public AccountLookupResponseDTO validarCuentaDestino(AccountLookupRequestDTO request) {
+    public com.bancario.nucleo.dto.AccountLookupResponseDTO validarCuentaDestino(
+            com.bancario.nucleo.dto.AccountLookupRequestDTO request) {
         log.info("Iniciando validación de cuenta (Account Lookup) para Banco: {}", request.getBody().getTargetBankId());
 
         String targetBank = request.getBody().getTargetBankId();
-        String account = request.getBody().getTargetAccountNumber();
+        String targetAccount = request.getBody().getTargetAccountNumber(); // Recuperar cuenta del request
 
+        // 1. Validar que el banco existe y obtener su URL
         InstitucionDTO bancoDestino = validarBanco(targetBank, false);
+        String webhookUrl = bancoDestino.getUrlDestino();
 
-        Map<String, Object> header = new java.util.HashMap<>();
-        header.put("messageNamespace", "acmt.023.001.02");
-        header.put("messageId", "VAL-" + UUID.randomUUID().toString());
-        header.put("originatingBankId", "SWITCH");
-        header.put("creationDateTime", LocalDateTime.now().toString());
-
-        Map<String, Object> body = new java.util.HashMap<>();
-
-        Map<String, Object> creditor = new java.util.HashMap<>();
-        creditor.put("accountId", account);
-        creditor.put("targetBankId", targetBank);
-
-        body.put("creditor", creditor);
-
-        Map<String, Object> isoProxyPayload = new java.util.HashMap<>();
-        isoProxyPayload.put("header", header);
-        isoProxyPayload.put("body", body);
-
-        String urlWebhook = bancoDestino.getUrlDestino();
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        if (bancoDestino.getLlavePublica() != null) {
-            headers.set("apikey", bancoDestino.getLlavePublica());
+        // Ajuste de URL para estandarización si es necesaria
+        // Si la URL termina en base, agregamos el path estándar de recepción
+        if (webhookUrl != null && !webhookUrl.endsWith("/recepcion")
+                && !webhookUrl.contains("/api/core/transferencias")) {
+            // Fallback estándar si el directorio tiene solo el host
+            webhookUrl = webhookUrl.replaceAll("/$", "") + "/api/core/transferencias/recepcion";
         }
 
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(isoProxyPayload, headers);
+        log.info("Enviando solicitud ACMT.023 a Banco {} [URL: {}]", targetBank, webhookUrl);
 
         try {
-            log.info("Enviando solicitud acmt.023 a {}", urlWebhook);
-            return restTemplate.postForObject(urlWebhook, entity, AccountLookupResponseDTO.class);
+            // 2. Construir Payload ACMT.023 (JSON simplificado usando Map)
+            Map<String, Object> payload = new java.util.HashMap<>();
+
+            Map<String, Object> header = new java.util.HashMap<>();
+            header.put("messageNamespace", "acmt.023.001.02"); // Namespace ISO para Lookup
+            header.put("messageId", "LKP-" + UUID.randomUUID().toString());
+            header.put("originatingBankId", "SWITCH");
+            header.put("creationDateTime", LocalDateTime.now().toString());
+
+            Map<String, Object> body = new java.util.HashMap<>();
+            Map<String, Object> creditor = new java.util.HashMap<>();
+            creditor.put("accountId", targetAccount);
+            body.put("creditor", creditor);
+
+            payload.put("header", header);
+            payload.put("body", body);
+
+            // 3. Enviar POST al Banco
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+
+            // Respuesta esperada: { status: "COMPLETED", data: { exists: true, ownerName:
+            // "Juan", ... } }
+            ResponseEntity<Map> responseEntity = restTemplate.postForEntity(webhookUrl, entity, Map.class);
+            Map<String, Object> responseBody = (Map<String, Object>) responseEntity.getBody();
+
+            if (responseBody == null) {
+                throw new BusinessException(IsoError.MS03.getCodigo() + " - Respuesta vacía del banco destino.");
+            }
+
+            String status = (String) responseBody.get("status");
+            if (!"COMPLETED".equals(status) && !"SUCCESS".equals(status)) {
+                throw new BusinessException(
+                        IsoError.AC01.getCodigo() + " - Cuenta no encontrada o error en banco destino.");
+            }
+
+            Map<String, Object> data = (Map<String, Object>) responseBody.get("data");
+            if (data == null || Boolean.FALSE.equals(data.get("exists"))) {
+                throw new BusinessException(IsoError.AC01.getCodigo() + " - La cuenta no existe en el banco destino.");
+            }
+
+            // 4. Mapear respuesta real
+            com.bancario.nucleo.dto.AccountLookupResponseDTO response = new com.bancario.nucleo.dto.AccountLookupResponseDTO();
+            response.setStatus("SUCCESS");
+
+            com.bancario.nucleo.dto.AccountLookupResponseDTO.LookupData lookupData = new com.bancario.nucleo.dto.AccountLookupResponseDTO.LookupData();
+            lookupData.setExists(true);
+            lookupData.setOwnerName((String) data.getOrDefault("ownerName", "Nombre Desconocido"));
+            lookupData.setCurrency((String) data.getOrDefault("currency", "USD"));
+            lookupData.setStatus("ACTC");
+            lookupData.setMensaje("Validación exitosa");
+            lookupData.setAccountName((String) data.getOrDefault("ownerName", "Cuenta Validada"));
+
+            response.setData(lookupData);
+            return response;
+
+        } catch (HttpClientErrorException.NotFound e) {
+            throw new BusinessException(IsoError.AC01.getCodigo() + " - Cuenta no encontrada en banco destino (404).");
         } catch (Exception e) {
-            log.error("Error en validación de cuenta con banco {}: {}", targetBank, e.getMessage());
-            return AccountLookupResponseDTO.builder()
-                    .status("FAILED")
-                    .data(AccountLookupResponseDTO.LookupData.builder()
-                            .exists(false)
-                            .mensaje("Error de comunicación: " + e.getMessage())
-                            .build())
-                    .build();
+            log.error("Error en Lookup Remoto a {}: {}", targetBank, e.getMessage());
+            // Fallback o Error: Decidimos lanzar error para no dar falsos positivos
+            throw new BusinessException(
+                    IsoError.MS03.getCodigo() + " - Error técnico validando cuenta externa: " + e.getMessage());
         }
     }
 

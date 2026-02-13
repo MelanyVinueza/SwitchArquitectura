@@ -42,11 +42,50 @@ public class Transaccion {
     @Column(name = "fechaCreacion")
     private LocalDateTime fechaCreacion;
 
+    // Campos agregados para cumplir con especificación DNS
+    @Column(name = "cuentaOrigen", length = 34)
+    private String cuentaOrigen;
+
+    @Column(name = "cuentaDestino", length = 34)
+    private String cuentaDestino;
+
+    @Column(name = "idBeneficiario", length = 20)
+    private String idBeneficiario;
+
+    @Column(name = "reintentos")
+    private Integer reintentos = 0;
+
+    @Column(name = "codigoError", length = 10)
+    private String codigoError;
+
+    @Column(name = "idCicloCompensacion")
+    private Integer idCicloCompensacion;
+
+    @Column(name = "fechaEncolado")
+    private LocalDateTime fechaEncolado;
+
+    @Column(name = "fechaCompletado")
+    private LocalDateTime fechaCompletado;
+
+    // Código de referencia bancario de 6 dígitos para devoluciones
+    @Column(name = "codigo_referencia", length = 6, unique = true)
+    private String codigoReferencia;
+
     public Transaccion() {
     }
 
     public Transaccion(UUID idInstruccion) {
         this.idInstruccion = idInstruccion;
+    }
+
+    /**
+     * Genera un código de referencia bancario de 6 dígitos numéricoxs.
+     * Ejemplo: "847293"
+     */
+    public static String generarCodigoReferencia() {
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        int numero = 100000 + random.nextInt(900000); // Rango: 100000-999999
+        return String.valueOf(numero);
     }
 
     @Override

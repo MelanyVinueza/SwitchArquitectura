@@ -4,7 +4,6 @@ import com.bancario.devolucion.dto.SolicitudCreacionDTO;
 import com.bancario.devolucion.dto.SolicitudDevolucionDTO;
 import com.bancario.devolucion.mapper.DevolucionMapper;
 import com.bancario.devolucion.modelo.SolicitudDevolucion;
-import com.bancario.devolucion.repositorio.CatalogoErrorRepositorio;
 import com.bancario.devolucion.repositorio.SolicitudDevolucionRepositorio;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,18 +20,14 @@ import java.util.UUID;
 public class SolicitudDevolucionServicio {
 
     private final SolicitudDevolucionRepositorio repo;
-    private final CatalogoErrorRepositorio catalogoErrorRepository;
     private final DevolucionMapper mapper;
 
     @Transactional
     public SolicitudDevolucionDTO create(SolicitudCreacionDTO req) {
         log.info("Creando Devolución id={} original={}", req.getId(), req.getIdInstruccionOriginal());
 
-        log.info("Validando motivo '{}'", req.getCodigoMotivo());
-        if (!catalogoErrorRepository.existsById(req.getCodigoMotivo())) {
-            log.warn("Motivo '{}' desconocido. Mapeando a MS03 para procesar la devolución.", req.getCodigoMotivo());
-            req.setCodigoMotivo("MS03");
-        }
+        // Validación de catálogo eliminada para v3.0: Aceptamos códigos estándar ISO
+        // directamente
 
         if (repo.existsById(req.getId())) {
             throw new RuntimeException("DEVOLUCION_EXISTS: La solicitud de devolución ya existe.");
